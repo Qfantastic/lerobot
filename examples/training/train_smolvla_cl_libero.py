@@ -1154,12 +1154,29 @@ def eval_sequential(
     output_dir: Path,
     device: torch.device,
 ) -> dict:
-    """Evaluate sequential CL: each task uses its own saved full checkpoint."""
+    """Evaluate sequential CL: each task uses its own saved full checkpoint.
+
+    If args.eval_task is set (>= 0), ALL tasks in task_indices are evaluated
+    using the single checkpoint from that task order, enabling measurement of
+    catastrophic forgetting across the CL sequence.
+    """
     from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
     from lerobot.envs.factory import make_env_pre_post_processors
 
     results = {}
     suite_name = args.eval_suite or args.dataset_repo_id.split("/")[-1].replace("_image", "")
+
+    # Determine the fixed checkpoint to use (if --eval_task is set)
+    fixed_ckpt_path = None
+    if args.eval_task is not None:
+        fixed_ckpt_key = str(args.eval_task)
+        if fixed_ckpt_key not in cl_state["task_checkpoints"]:
+            raise ValueError(
+                f"--eval_task {args.eval_task} not found in saved checkpoints. "
+                f"Available task_orders: {sorted(cl_state['task_checkpoints'].keys())}"
+            )
+        fixed_ckpt_path = cl_state["task_checkpoints"][fixed_ckpt_key]
+        log.info(f"  [CL-forgetting mode] All tasks evaluated with checkpoint from task_order={args.eval_task}: {fixed_ckpt_path}")
 
     # Build task_index → LIBERO task_id mapping (ordering differs between LeRobot and LIBERO)
     log.info("  Building LeRobot→LIBERO task_id mapping…")
@@ -1172,7 +1189,7 @@ def eval_sequential(
             continue
 
         libero_task_id = task_id_map[task_idx]
-        ckpt_path = cl_state["task_checkpoints"][ckpt_key]
+        ckpt_path = fixed_ckpt_path if fixed_ckpt_path is not None else cl_state["task_checkpoints"][ckpt_key]
         task_name = get_task_name(ds_meta, task_idx)
         log.info(f"\n[Eval-Sequential] task_idx={task_idx} → LIBERO task_id={libero_task_id} | {task_name!r}")
         log.info(f"  Loading: {ckpt_path}")
@@ -1413,8 +1430,8 @@ def run(args: argparse.Namespace) -> None:
     log.info(f"CL sequence ({len(task_indices)} tasks): {task_indices}")
 
     # ── 参数校验 ─────────────────────────────────────────────────
-    if args.cl_method == "tail" and not args.use_lora:
-        raise ValueError("--cl_method tail 必须配合 --use_lora 使用。")
+    if args.cl_method == "tail" and not args.use_lora and not args.eval_rollout:
+        raise ValueError("--cl_method tail requires --use_lora.")
 
     # ── Training phase ────────────────────────────────────────────
     _ddp_kwargs = dict(device=device, rank=rank, world_size=world_size,
@@ -1549,6 +1566,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval_suite", default=None,
                    help="LIBERO suite name for evaluation (default: inferred from dataset_repo_id). "
                         "E.g. 'libero_spatial', 'libero_10'.")
+    p.add_argument("--eval_task", type=int, default=None,
+                   help="(Sequential only) Fix a single checkpoint (by task_order) to evaluate ALL tasks. "
+                        "E.g. --eval_task 1 uses the task_01 checkpoint for every task in --task_indices, "
+                        "measuring catastrophic forgetting. Default (None) uses each task's own checkpoint.")
 
     # ── Hardware ──────────────────────────────────────────────────
     p.add_argument("--gpus", default="0",
