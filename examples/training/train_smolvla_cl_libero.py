@@ -1153,6 +1153,7 @@ def eval_sequential(
     task_indices: list[int],
     output_dir: Path,
     device: torch.device,
+    eval_output_dir: Path | None = None,
 ) -> dict:
     """Evaluate sequential CL: each task uses its own saved full checkpoint.
 
@@ -1214,7 +1215,8 @@ def eval_sequential(
         env_cfg = LiberoEnvConfig(task=suite_name, task_ids=[libero_task_id], camera_name_mapping=_cam_map)
         env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg, policy.config)
 
-        videos_dir = (output_dir / "eval_videos" / f"task{task_idx}") if args.save_videos else None
+        _vdir_root = eval_output_dir if eval_output_dir is not None else output_dir
+        videos_dir = (_vdir_root / "eval_videos" / f"task{task_idx}") if args.save_videos else None
         metrics = _run_rollout_episodes(
             policy, preprocessor, postprocessor,
             env_preprocessor, env_postprocessor,
@@ -1463,15 +1465,20 @@ def run(args: argparse.Namespace) -> None:
             )
 
         eval_device = device
+        eval_output_dir = Path(args.eval_output_dir) if args.eval_output_dir else None
+        if eval_output_dir is not None:
+            eval_output_dir.mkdir(parents=True, exist_ok=True)
+            log.info(f"  Eval results will be saved to: {eval_output_dir}")
         method = cl_state.get("cl_method", args.cl_method)
         if method == "tail":
             library_dir = output_dir / "lora_library"
             lora_lib = LoRALibrary(library_dir)
             results = eval_tail(args, lora_lib, ds_meta, task_indices, eval_device)
         else:  # sequential
-            results = eval_sequential(args, cl_state, ds_meta, task_indices, output_dir, eval_device)
+            results = eval_sequential(args, cl_state, ds_meta, task_indices, output_dir, eval_device,
+                                      eval_output_dir=eval_output_dir)
 
-        save_eval_results(results, output_dir, suffix=f"_{method}")
+        save_eval_results(results, eval_output_dir or output_dir, suffix=f"_{method}")
 
     if is_main:
         log.info("\n" + "="*60)
@@ -1570,6 +1577,9 @@ def parse_args() -> argparse.Namespace:
                    help="(Sequential only) Fix a single checkpoint (by task_order) to evaluate ALL tasks. "
                         "E.g. --eval_task 1 uses the task_01 checkpoint for every task in --task_indices, "
                         "measuring catastrophic forgetting. Default (None) uses each task's own checkpoint.")
+    p.add_argument("--eval_output_dir", default=None,
+                   help="Directory to save eval results (eval_results_*.json) and videos. "
+                        "Defaults to --output_dir if not set.")
 
     # ── Hardware ──────────────────────────────────────────────────
     p.add_argument("--gpus", default="0",
