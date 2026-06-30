@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Continual Learning (CL) training of SmolVLA on LIBERO benchmark.
+"""Continual Learning (CL) training of X-VLA on LIBERO benchmark.
 
 Supported CL methods (--cl_method):
 
@@ -32,55 +32,89 @@ Supported CL methods (--cl_method):
 
 LoRA library layout (TAIL mode):
   output_dir/lora_library/
-    manifest.json                         ← task registry
-    task_tidx0/adapter_model.safetensors  ← adapter weights only (~MBs)
-    task_tidx0/policy_preprocessor.json   ← per-task normalization stats
+    manifest.json                         <- task registry
+    task_tidx0/adapter_model.safetensors  <- adapter weights (~MBs)
+    task_tidx0/policy_preprocessor.json   <- per-task processor config
     task_tidx1/...
+
+Key XVLA-specific notes vs Pi05:
+  - Normalization: IDENTITY (no quantile stats required unlike Pi05/quantile error)
+  - Tokenizer: facebook/bart-large (non-gated, no HF license gate needed)
+  - VLM backbone: Florence2 (not PaliGemma). VLM uses 1/10 LR in full fine-tuning
+    mode (XVLAAdamWConfig default), replicated here via --vlm_lr_scale.
+  - Soft prompts: 32-dim learnable per-domain embeddings (30 domain slots).
+    freeze flags: --freeze_vision_encoder, --freeze_language_encoder
+    (replaces --train_expert_only from Pi05)
+  - Default chunk_size=32 (not 50 as in Pi05)
+  - Default action_mode=ee6d for LIBERO (end-effector + 6D rotation)
 
 Usage examples:
 
   # TAIL with LoRA (recommended for CL research):
-  python train_smolvla_cl_libero.py \\
-      --pretrained lerobot/smolvla_base \\
-      --dataset_repo_id lerobot/libero_spatial \\
-      --output_dir outputs/tail_smolvla_libero_spatial \\
+  python train_xvla_cl_libero.py \\
+      --pretrained lerobot/xvla-base \\
+      --dataset_repo_id lerobot/libero_10 \\
+      --output_dir outputs/tail_xvla_libero10 \\
       --cl_method tail --use_lora \\
-      --steps_per_task 5000
+      --lora_r 64 --lora_alpha 64 \\
+      --steps_per_task 10000
 
-  # Sequential with LoRA:
-  python train_smolvla_cl_libero.py \\
+  # Sequential with LoRA + language encoder frozen (recommended):
+  python train_xvla_cl_libero.py \\
       --dataset_repo_id lerobot/libero_10 \\
       --cl_method sequential --use_lora \\
-      --lora_r 32 --steps_per_task 10000
+      --lora_r 64 --lora_alpha 64 \\
+      --freeze_language_encoder \\
+      --steps_per_task 10000
 
-  # Sequential without LoRA (full fine-tuning):
-  python train_smolvla_cl_libero.py \\
+  # Sequential full fine-tuning (official recommended: VLM 1/10 LR, transformer full LR):
+  python train_xvla_cl_libero.py \\
       --dataset_repo_id lerobot/libero_10 \\
-      --cl_method sequential --steps_per_task 5000
+      --cl_method sequential \\
+      --steps_per_task 10000
+  # All params trainable: VLM at --vlm_lr_scale=0.1x, transformer at 1x, soft prompts at 1x
+  # Matches XVLAAdamWConfig.build() differential-LR strategy.
+
+  # Phase II (freeze VLM entirely, train only policy transformer + soft prompts):
+  python train_xvla_cl_libero.py \\
+      --dataset_repo_id lerobot/libero_10 \\
+      --cl_method sequential \\
+      --phase2 \\
+      --steps_per_task 10000
+  # 311M / 879M trainable (35%). Recommended when VLM features are already well aligned.
+
+  # Sequential with LoRA + policy transformer (language encoder LoRA + transformer full):
+  python train_xvla_cl_libero.py \\
+      --dataset_repo_id lerobot/libero_10 \\
+      --cl_method sequential --use_lora \\
+      --lora_r 64 --lora_alpha 64 \\
+      --steps_per_task 10000
+  # LoRA on VLM Q/V projections; policy transformer + soft prompts also unfrozen.
 
   # Evaluate TAIL library with rollouts (requires libero installed):
-  python train_smolvla_cl_libero.py \\
-      --output_dir outputs/tail_smolvla_libero_spatial \\
+  python train_xvla_cl_libero.py \\
+      --output_dir outputs/tail_xvla_libero10 \\
       --eval_rollout --n_eval_episodes 20 --resume
 
   # Resume interrupted training:
-  python train_smolvla_cl_libero.py \\
-      --output_dir outputs/tail_smolvla_libero_spatial \\
+  python train_xvla_cl_libero.py \\
+      --output_dir outputs/tail_xvla_libero10 \\
       --resume
 
-Multi-GPU examples (DDP via torchrun — DataParallel is NOT supported):
+Multi-GPU examples (DDP via torchrun):
 
   # 4-GPU DDP (TAIL):
-  torchrun --nproc_per_node=4 train_smolvla_cl_libero.py --cl_method tail --use_lora ...
+  torchrun --nproc_per_node=4 train_xvla_cl_libero.py --cl_method tail --use_lora ...
 
   # 2-GPU DDP (sequential):
-  torchrun --nproc_per_node=2 train_smolvla_cl_libero.py --cl_method sequential ...
+  torchrun --nproc_per_node=2 train_xvla_cl_libero.py --cl_method sequential ...
 
   # Single GPU:
-  python train_smolvla_cl_libero.py --gpus 3 --cl_method tail --use_lora ...
+  python train_xvla_cl_libero.py --gpus 3 --cl_method tail --use_lora ...
 """
 
 import argparse
+import copy
 import json
 import logging
 import math
@@ -97,7 +131,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.policies.smolvla import SmolVLAConfig, SmolVLAPolicy
+from lerobot.policies.xvla import XVLAConfig, XVLAPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.random_utils import set_seed
@@ -121,60 +155,59 @@ def _require_peft():
         )
 
 
-class _SmolVLALoRABridge(torch.nn.Module):
-    """Bridge between PeftModel and SmolVLAPolicy.
+class _XVLALoRABridge(torch.nn.Module):
+    """Bridge between PeftModel and XVLAPolicy.
 
-    PeftModelForFeatureExtraction.forward has signature:
-        forward(self, input_ids=None, attention_mask=None, ...)
-    so when we call peft_model(batch_dict), Python binds batch_dict to
-    `input_ids`. The PeftModel then calls base_model(input_ids=batch_dict, ...),
-    which would fail on SmolVLAPolicy.forward(batch) because it doesn't accept
-    keyword arguments.
-
-    This wrapper's forward accepts input_ids and interprets it as the full
-    batch dict, correctly routing it to SmolVLAPolicy.forward(batch).
+    PeftModelForFeatureExtraction.forward binds the first positional arg to
+    `input_ids`. We pass the entire batch dict as that first positional arg,
+    then route it to XVLAPolicy.forward(batch). The real `input_ids` key
+    (tokenized language) inside the batch dict is handled by XVLAPolicy internally.
     """
 
-    def __init__(self, policy: SmolVLAPolicy):
+    def __init__(self, policy: XVLAPolicy):
         super().__init__()
         self.policy = policy
-        # Expose config so get_base_config() can find SmolVLAConfig through PEFT layers
         self.config = policy.config
 
     def forward(self, input_ids=None, **kwargs):
-        # PeftModelForFeatureExtraction calls: base_model(input_ids=batch_dict, ...)
-        # where input_ids is actually our batch dict passed as a positional arg.
         if isinstance(input_ids, dict):
             return self.policy(input_ids)
         raise TypeError(
-            f"_SmolVLALoRABridge.forward: expected batch dict in 'input_ids', "
-            f"got {type(input_ids)}. Did you call peft_model(batch_dict)?"
+            f"_XVLALoRABridge.forward: expected batch dict in 'input_ids', "
+            f"got {type(input_ids)}."
         )
 
 
+def _parse_lora_targets(s: str):
+    """Return regex string or list[str] for LoraConfig.target_modules."""
+    if any(c in s for c in ('|', '(', '[', '\\')):
+        return s
+    return [m.strip() for m in s.split(",") if m.strip()]
+
+
 def apply_lora(
-    policy: SmolVLAPolicy,
+    policy: XVLAPolicy,
     r: int,
     alpha: int,
     dropout: float,
-    target_modules: list[str],
+    target_modules,
+    train_policy_transformer: bool = True,
+    train_soft_prompts: bool = True,
 ) -> Any:
     """Wrap policy in a PEFT LoRA model; return PeftModel for training.
 
-    Architecture:
-        PeftModel
-          └── LoraModel (BaseTuner)
-                └── _SmolVLALoRABridge   ← PEFT-compatible forward bridge
-                      └── SmolVLAPolicy  ← LoRA injected into target modules here
+    PEFT's get_peft_model() freezes ALL base model params and adds trainable LoRA
+    adapters. For sequential CL (and any mode where we want the policy transformer
+    to adapt), we re-enable requires_grad on the transformer and soft prompts
+    *after* PEFT setup, so they train alongside the LoRA adapters.
 
-    The bridge is required because PeftModelForFeatureExtraction.forward binds
-    the first positional argument to `input_ids`, but SmolVLAPolicy.forward
-    expects a single batch dict.
+    For TAIL (per-task adapters on a frozen base), pass train_policy_transformer=False
+    and train_soft_prompts=False to keep only LoRA adapters trainable.
     """
     _require_peft()
     from peft import LoraConfig, TaskType, get_peft_model
 
-    bridge = _SmolVLALoRABridge(policy)
+    bridge = _XVLALoRABridge(policy)
     lora_cfg = LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -184,44 +217,45 @@ def apply_lora(
         task_type=TaskType.FEATURE_EXTRACTION,
     )
     peft_model = get_peft_model(bridge, lora_cfg)
+
+    # Re-enable policy transformer and/or soft prompts after PEFT froze everything.
+    base_policy = peft_model.base_model.model.policy
+    if train_policy_transformer:
+        for name, param in base_policy.model.transformer.named_parameters():
+            if "soft_prompt" not in name:
+                param.requires_grad = True
+    if train_soft_prompts and hasattr(base_policy.model.transformer, "soft_prompt_hub"):
+        base_policy.model.transformer.soft_prompt_hub.weight.requires_grad = True
+
     peft_model.print_trainable_parameters()
     return peft_model
 
 
 def save_lora_adapter(peft_model: Any, save_dir: Path) -> None:
-    """Save only the LoRA adapter weights (tiny checkpoint)."""
     save_dir.mkdir(parents=True, exist_ok=True)
     peft_model.save_pretrained(str(save_dir))
-    log.info(f"LoRA adapter saved → {save_dir}")
+    log.info(f"LoRA adapter saved -> {save_dir}")
 
 
-def load_lora_adapter(base_policy: SmolVLAPolicy, adapter_dir: Path) -> Any:
-    """Reconstruct a PeftModel from a saved LoRA adapter for inference."""
+def load_lora_adapter(base_policy: XVLAPolicy, adapter_dir: Path) -> Any:
     _require_peft()
     from peft import PeftModel
 
-    bridge = _SmolVLALoRABridge(base_policy)
+    bridge = _XVLALoRABridge(base_policy)
     return PeftModel.from_pretrained(bridge, str(adapter_dir), is_trainable=False)
 
 
-def merge_lora_into_policy(peft_model: Any) -> SmolVLAPolicy:
-    """Merge LoRA weights into the base SmolVLAPolicy and return it.
-
-    After merging, the returned SmolVLAPolicy can be used for inference or
-    saved with save_pretrained() to produce a checkpoint the next task can
-    load with SmolVLAPolicy.from_pretrained().
-    """
-    merged_bridge: _SmolVLALoRABridge = peft_model.merge_and_unload()
-    # merge_and_unload() returns the inner module (our bridge)
+def merge_lora_into_policy(peft_model: Any) -> XVLAPolicy:
+    """Merge LoRA weights into the base XVLAPolicy and return it."""
+    merged_bridge: _XVLALoRABridge = peft_model.merge_and_unload()
     return merged_bridge.policy
 
 
-def get_base_config(policy: Any) -> SmolVLAConfig:
-    """Return SmolVLAConfig through DataParallel and/or PEFT wrappers."""
+def get_base_config(policy: Any) -> XVLAConfig:
     p = unwrap_dp(policy)
-    if hasattr(p, "base_model"):        # PeftModel → LoraModel → bridge → policy
-        return p.base_model.model.config  # _SmolVLALoRABridge.config = SmolVLAConfig
-    if isinstance(p, _SmolVLALoRABridge):
+    if hasattr(p, "base_model"):
+        return p.base_model.model.config
+    if isinstance(p, _XVLALoRABridge):
         return p.config
     return p.config
 
@@ -235,24 +269,16 @@ def get_trainable_params(policy: Any) -> list:
 # ══════════════════════════════════════════════════════════════════
 
 def parse_gpus(gpus_str: str) -> list[int]:
-    """'0,1,2,3' → [0, 1, 2, 3].  Empty string → [] (use CPU)."""
     return [int(g.strip()) for g in gpus_str.split(",") if g.strip()]
 
 
 def primary_device(gpu_ids: list[int]) -> torch.device:
-    """Return the primary (first) CUDA device, or CPU if none."""
     if gpu_ids and torch.cuda.is_available():
         return torch.device(f"cuda:{gpu_ids[0]}")
     return torch.device("cpu")
 
 
 def init_ddp() -> tuple[bool, int, int, int]:
-    """Initialize torch.distributed if launched via torchrun.
-
-    Returns (is_ddp, local_rank, rank, world_size).
-    When not using torchrun (single process), returns (False, 0, 0, 1).
-    Launch with: torchrun --nproc_per_node=4 train_smolvla_cl_libero.py ...
-    """
     if "RANK" not in os.environ:
         return False, 0, 0, 1
     dist.init_process_group(backend="nccl")
@@ -269,33 +295,23 @@ def wrap_dp(
     local_rank: int = 0,
     is_ddp: bool = False,
 ) -> Any:
-    """Wrap policy with DistributedDataParallel when using torchrun.
-
-    DataParallel is NOT used — SmolVLA's dict-based forward(batch) is incompatible
-    with DP's **kwargs unpacking. DDP calls module(batch) directly and works fine.
-    Use `torchrun --nproc_per_node=N` to enable multi-GPU training.
-    """
     if is_ddp:
-        # find_unused_parameters=True needed because some params may not contribute
-        # to loss depending on the batch (e.g. empty_camera projections).
-        return DDP(policy, device_ids=[local_rank], find_unused_parameters=True)
+        return DDP(policy, device_ids=[local_rank], find_unused_parameters=False)
     if len(gpu_ids) > 1:
         log.warning(
-            f"  --gpus {gpu_ids}: DataParallel disabled for SmolVLA. "
+            f"  --gpus {gpu_ids}: DataParallel disabled. "
             f"Use `torchrun --nproc_per_node={len(gpu_ids)}` for multi-GPU DDP."
         )
     return policy
 
 
 def unwrap_dp(policy: Any) -> Any:
-    """Strip DataParallel or DistributedDataParallel wrapper."""
     if isinstance(policy, (torch.nn.DataParallel, DDP)):
         return policy.module
     return policy
 
 
 def log_gpu_stats(gpu_ids: list[int], prefix: str = "") -> None:
-    """Log current memory usage for each training GPU."""
     if not torch.cuda.is_available():
         return
     parts = []
@@ -311,22 +327,7 @@ def log_gpu_stats(gpu_ids: list[int], prefix: str = "") -> None:
 # ══════════════════════════════════════════════════════════════════
 
 class LoRALibrary:
-    """Manages per-task LoRA adapters for the TAIL method.
-
-    Manifest structure (manifest.json):
-    {
-      "base_model": "<hub_id_or_path>",
-      "dataset_repo_id": "...",
-      "adapters": {
-        "<task_index>": {
-          "task_index": int,
-          "task_name": str,            # natural language task description
-          "adapter_path": str,         # path to adapter weights dir
-          "preprocessor_path": str,    # path to normalization stats
-        }, ...
-      }
-    }
-    """
+    """Manages per-task LoRA adapters for the TAIL method."""
 
     def __init__(self, library_dir: Path):
         self.library_dir = library_dir
@@ -384,31 +385,30 @@ class LoRALibrary:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Suite → task index mapping  (HuggingFaceVLA/libero has 40 tasks)
+# Suite -> task index mapping
 # ══════════════════════════════════════════════════════════════════
 
 SUITE_TASK_RANGES: dict[str, range] = {
-    "libero_spatial": range(0, 10),   # spatial relations (same objects, diff positions)
-    "libero_object":  range(10, 20),  # object manipulation (same scene, diff objects)
-    "libero_goal":    range(20, 30),  # goal-conditioned  (same action, diff objects)
-    "libero_10":      range(30, 40),  # long-horizon      (same object, diff locations)
+    "libero_spatial": range(0, 10),
+    "libero_object":  range(10, 20),
+    "libero_goal":    range(20, 30),
+    "libero_10":      range(30, 40),
 }
 
 SUITE_ALIASES: dict[str, str] = {
-    "spatial":  "libero_spatial",
-    "object":   "libero_object",
-    "goal":     "libero_goal",
-    "libero_goal": "libero_goal",
+    "spatial":        "libero_spatial",
+    "object":         "libero_object",
+    "goal":           "libero_goal",
+    "libero_goal":    "libero_goal",
     "libero_spatial": "libero_spatial",
     "libero_object":  "libero_object",
-    "long":     "libero_10",
-    "libero_long": "libero_10",
-    "libero_10": "libero_10",
+    "long":           "libero_10",
+    "libero_long":    "libero_10",
+    "libero_10":      "libero_10",
 }
 
 
 def resolve_suite(suite_name: str) -> list[int]:
-    """Return task indices for a named LIBERO suite."""
     key = SUITE_ALIASES.get(suite_name.lower(), suite_name.lower())
     if key not in SUITE_TASK_RANGES:
         valid = list(SUITE_ALIASES.keys())
@@ -423,11 +423,7 @@ def resolve_suite(suite_name: str) -> list[int]:
 def build_policy_features_from_dataset(
     ds_meta: LeRobotDatasetMetadata,
 ) -> tuple[dict, dict]:
-    """Derive PolicyFeature dicts (input, output) from a LeRobotDatasetMetadata.
-
-    Video/image features use CHW ordering: (C, H, W).
-    Dataset metadata stores them in HWC ordering: [H, W, C], so we transpose.
-    """
+    """Derive PolicyFeature dicts (input, output) from a LeRobotDatasetMetadata."""
     from lerobot.configs.types import FeatureType, PolicyFeature
 
     _SKIP = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
@@ -441,7 +437,6 @@ def build_policy_features_from_dataset(
         shape = feat_info.get("shape", [])
 
         if dtype in ("video", "image"):
-            # Dataset shape is HWC [H, W, C] → convert to CHW (C, H, W)
             if len(shape) == 3 and shape[2] in (1, 3, 4):
                 policy_shape = (shape[2], shape[0], shape[1])
             else:
@@ -456,13 +451,13 @@ def build_policy_features_from_dataset(
 
 
 def cache_pretrained_weights(pretrained: str) -> tuple[Any, dict]:
-    """Load pretrained SmolVLA once and return (config, cpu_state_dict).
+    """Load pretrained XVLA once and return (config, cpu_state_dict).
 
-    Used by run_tail to avoid reloading the same pretrained checkpoint for
-    every task (10 tasks × ~1GB load = significant waste).
+    Used by run_tail to avoid reloading ~0.9B Florence2 weights N times.
+    CLI overrides are applied later in load_base_policy() per-task.
     """
-    log.info(f"  Pre-loading pretrained weights (will be reused for all tasks): {pretrained}")
-    base = SmolVLAPolicy.from_pretrained(pretrained)
+    log.info(f"  Pre-loading pretrained XVLA weights (reused for all tasks): {pretrained}")
+    base = XVLAPolicy.from_pretrained(pretrained)
     config = base.config
     state = {k: v.cpu() for k, v in base.state_dict().items()}
     del base
@@ -474,16 +469,21 @@ def load_base_policy(
     pretrained: str,
     ds_meta: LeRobotDatasetMetadata,
     device: torch.device,
+    args: argparse.Namespace | None = None,
     _cached: tuple | None = None,
-) -> SmolVLAPolicy:
-    """Load SmolVLAPolicy with features adapted to the dataset.
+) -> XVLAPolicy:
+    """Load XVLAPolicy with features adapted to the dataset.
 
-    lerobot/smolvla_base was trained with camera1/camera2/camera3 + state(6).
-    lerobot/libero_10 has image/wrist_image + state(8) + action(7).
-    This mismatch would cause a shape error in the action head layers.
-
-    Pass `_cached=(config, state_dict)` from `cache_pretrained_weights()` to
-    skip the expensive pretrained load when calling this in a tight loop (TAIL).
+    XVLA notes vs Pi05:
+    - XVLAPolicy(config) initializes Florence2 from config (random weights).
+      load_state_dict(strict=False) loads the cached pretrained weights.
+    - IDENTITY normalization means dataset_stats are not needed for normalizer.
+    - Tokenizer is facebook/bart-large (non-gated).
+    - CLI flags override config: dtype, freeze_vision_encoder,
+      freeze_language_encoder, train_policy_transformer, train_soft_prompts,
+      action_mode, num_denoising_steps.
+    - In full fine-tuning mode, VLM params use vlm_lr_scale * lr (see
+      _make_optimizer_and_scheduler), matching XVLAAdamWConfig's 1/10 VLM LR.
     """
     input_features, output_features = build_policy_features_from_dataset(ds_meta)
     log.info(f"  Dataset input_features : {list(input_features.keys())}")
@@ -491,32 +491,55 @@ def load_base_policy(
 
     if _cached is not None:
         config, base_state = _cached
-        # config is shared — make a shallow copy before mutating features
-        import copy
         config = copy.copy(config)
-        # Skip VLM weight loading: state_dict already contains them
-        config.load_vlm_weights = False
     else:
-        log.info(f"  Loading pretrained SmolVLA: {pretrained}")
-        base = SmolVLAPolicy.from_pretrained(pretrained)
+        log.info(f"  Loading pretrained XVLA: {pretrained}")
+        base = XVLAPolicy.from_pretrained(pretrained)
         config = base.config
         base_state = {k: v.cpu() for k, v in base.state_dict().items()}
         del base
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # Override config with dataset features
     config.input_features = input_features
     config.output_features = output_features
 
-    # Re-instantiate model with dataset-appropriate config, load matching weights
-    policy = SmolVLAPolicy(config)
+    # Apply CLI overrides for XVLA-specific training flags
+    if args is not None:
+        config.dtype = args.dtype
+        config.freeze_vision_encoder = args.freeze_vision_encoder
+        config.freeze_language_encoder = args.freeze_language_encoder
+        config.train_policy_transformer = args.train_policy_transformer
+        config.train_soft_prompts = args.train_soft_prompts
+        config.action_mode = args.action_mode
+        config.num_denoising_steps = args.num_denoising_steps
+        config.chunk_size = args.chunk_size
+        config.n_obs_steps = args.n_obs_steps
+        config.tokenizer_max_length = args.tokenizer_max_length
+        log.info(f"  dtype={config.dtype}  freeze_vision={config.freeze_vision_encoder}  "
+                 f"freeze_language={config.freeze_language_encoder}  "
+                 f"train_transformer={config.train_policy_transformer}  "
+                 f"train_soft_prompts={config.train_soft_prompts}  "
+                 f"action_mode={config.action_mode}")
+
+    # The pretrained model has tokenizer_max_length=1024 + pad_language_to=max_length.
+    # LIBERO task descriptions are ~25-35 tokens; padding to 1024 creates vlm_features
+    # of ~1073 tokens which exceeds the policy transformer's max_len_seq=512.
+    # Override to pad only to longest in each batch.
+    config.pad_language_to = "longest"
+
+    policy = XVLAPolicy(config)
     missing, unexpected = policy.load_state_dict(base_state, strict=False)
     if missing:
         log.info(f"  Randomly initialized (dim mismatch): {len(missing)} keys "
                  f"(e.g. {missing[:3]})")
     if unexpected:
         log.info(f"  Skipped (not in new model): {len(unexpected)} keys")
+
+    # Re-apply dtype after load_state_dict: the cached state may be in a different
+    # dtype from the pretrained model config. This mirrors XVLAPolicy.from_pretrained
+    # which calls instance.model._apply_dtype() after loading weights.
+    policy.model._apply_dtype()
 
     return policy.to(device)
 
@@ -526,17 +549,11 @@ def load_base_policy(
 # ══════════════════════════════════════════════════════════════════
 
 def get_task_name(ds_meta: LeRobotDatasetMetadata, task_index: int) -> str:
-    """Return natural-language description for a given task_index."""
     matches = ds_meta.tasks[ds_meta.tasks["task_index"] == task_index]
     return matches.index[0] if len(matches) > 0 else f"task_{task_index}"
 
 
 def build_lerobot_to_libero_task_id_map(suite_name: str, ds_meta: LeRobotDatasetMetadata) -> dict[int, int]:
-    """Map LeRobot task_index → LIBERO benchmark task_id by matching task language strings.
-
-    LeRobot dataset and LIBERO benchmark use different task orderings for the same suite.
-    This function resolves the mapping so rollout evaluation uses the correct simulator task.
-    """
     from libero.libero import benchmark as libero_benchmark
 
     bm = libero_benchmark.get_benchmark_dict()
@@ -544,7 +561,6 @@ def build_lerobot_to_libero_task_id_map(suite_name: str, ds_meta: LeRobotDataset
         raise ValueError(f"Suite '{suite_name}' not found in LIBERO benchmark. Available: {list(bm.keys())}")
     suite = bm[suite_name]()
 
-    # LIBERO task_id → language (lower-stripped for matching)
     libero_lang_to_id: dict[str, int] = {}
     for i in range(suite.n_tasks):
         task = suite.get_task(i)
@@ -563,9 +579,9 @@ def build_lerobot_to_libero_task_id_map(suite_name: str, ds_meta: LeRobotDataset
             )
         mapping[lerobot_idx] = libero_id
 
-    log.info("  LeRobot→LIBERO task_id mapping:")
+    log.info("  LeRobot->LIBERO task_id mapping:")
     for lr_idx, lib_id in sorted(mapping.items()):
-        log.info(f"    LeRobot task_index={lr_idx} → LIBERO task_id={lib_id}")
+        log.info(f"    LeRobot task_index={lr_idx} -> LIBERO task_id={lib_id}")
     return mapping
 
 
@@ -593,39 +609,25 @@ def build_full_dataset(
     n_obs_steps: int,
     root: str | None,
 ) -> LeRobotDataset:
-    """Download and cache the COMPLETE dataset (no episode filtering).
-
-    lerobot/libero_10 stores all episodes in a single parquet + one video file
-    per camera (≈600 MB total). Loading everything at once is efficient; task
-    filtering is then done in-memory via TaskFilterDataset using the task_index
-    column already present in each parquet row.
-    """
     delta_ts = build_delta_timestamps(ds_meta, chunk_size, n_obs_steps)
-    log.info(f"  Loading full dataset {repo_id!r} (one-time ~600 MB download)…")
+    log.info(f"  Loading full dataset {repo_id!r}...")
     return LeRobotDataset(
         repo_id=repo_id,
         root=root,
-        episodes=None,          # all episodes, no filter
+        episodes=None,
         delta_timestamps=delta_ts,
     )
 
 
 class TaskFilterDataset(torch.utils.data.Dataset):
-    """Wraps a full LeRobotDataset and exposes only frames for one task_index.
-
-    Filters using the `task_index` column stored directly in each parquet row,
-    bypassing the broken episode-index → file-index mapping in HuggingFaceVLA/libero.
-    """
+    """Wraps a full LeRobotDataset and exposes only frames for one task_index."""
 
     def __init__(self, full_dataset: LeRobotDataset, task_index: int):
-        # Use the .hf_dataset property (ensures reader is loaded) to get raw PyArrow table.
-        # task_index is stored as scalar int64 (shape=(1,) → datasets.Value), so
-        # to_pylist() yields plain Python ints and direct comparison works.
-        arrow = full_dataset.hf_dataset.data                 # raw PyArrow Table, no transform
+        arrow = full_dataset.hf_dataset.data
         task_col = arrow.column("task_index").to_pylist()
         self._indices: list[int] = [i for i, t in enumerate(task_col) if t == task_index]
         self._full = full_dataset
-        self.meta = full_dataset.meta                        # exposes camera_keys etc.
+        self.meta = full_dataset.meta
         self.num_frames = len(self._indices)
         log.info(f"  TaskFilterDataset: task_index={task_index}, frames={self.num_frames}")
 
@@ -656,12 +658,12 @@ def make_cosine_warmup_scheduler(
 
 
 # ══════════════════════════════════════════════════════════════════
-# Core training loop (shared by all CL methods)
+# Core training loop
 # ══════════════════════════════════════════════════════════════════
 
 def train_steps(
-    policy: Any,                        # SmolVLAPolicy or PeftModel wrapping it
-    dataset: torch.utils.data.Dataset,  # LeRobotDataset or TaskFilterDataset
+    policy: Any,
+    dataset: torch.utils.data.Dataset,
     preprocessor: Any,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: Any,
@@ -673,15 +675,9 @@ def train_steps(
     log_freq: int = 100,
     rank: int = 0,
     world_size: int = 1,
-    wandb_log: "Callable[[dict], None] | None" = None,  # optional wandb logging callback
-    global_step_offset: int = 0,        # cumulative steps before this task (for wandb x-axis)
+    wandb_log: "Any | None" = None,
+    global_step_offset: int = 0,
 ) -> dict[str, float]:
-    """Train for `steps` gradient updates; return loss statistics.
-
-    With DDP (world_size > 1), each rank processes its own data shard via
-    DistributedSampler. Effective batch size = batch_size * world_size.
-    Loss logging is performed on every rank; saves are guarded by the caller.
-    """
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     if world_size > 1:
         sampler = DistributedSampler(
@@ -708,8 +704,7 @@ def train_steps(
             collate_fn=collate_fn,
             persistent_workers=(num_workers > 0),
         )
-    # For DDP, manually track epochs so DistributedSampler.set_epoch() is called
-    # at each new pass over the data (ensures different shuffle order per epoch).
+
     if world_size > 1:
         _epoch = 0
         _sampler = sampler
@@ -780,10 +775,56 @@ def train_steps(
 
 
 def _make_optimizer_and_scheduler(policy: Any, args: argparse.Namespace) -> tuple:
-    params = get_trainable_params(policy)
+    """Build optimizer and LR scheduler for XVLA.
+
+    Mirrors XVLAAdamWConfig.build() with three parameter groups:
+      - vlm        : Florence2 params   → lr * vlm_lr_scale (default 0.1x)
+      - soft_prompts: soft_prompt_hub   → lr * soft_prompt_lr_scale (default 1.0x)
+      - transformer : policy head + rest→ lr (1.0x)
+
+    In LoRA mode the same grouping applies: LoRA adapters land in "vlm" or
+    "transformer" depending on their name, soft prompts stay separate.
+    """
+    soft_prompt_lr_scale = getattr(args, "soft_prompt_lr_scale", 1.0)
+
+    vlm_params, soft_prompt_params, other_params = [], [], []
+    for name, param in policy.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "soft_prompt" in name:
+            soft_prompt_params.append(param)
+        elif "vlm" in name:
+            vlm_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": args.lr, "name": "transformer"})
+    if soft_prompt_params:
+        param_groups.append({
+            "params": soft_prompt_params,
+            "lr": args.lr * soft_prompt_lr_scale,
+            "name": "soft_prompts",
+        })
+    if vlm_params:
+        param_groups.append({
+            "params": vlm_params,
+            "lr": args.lr * args.vlm_lr_scale,
+            "name": "vlm",
+        })
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters found. Check freeze flags — "
+            "--freeze_vision_encoder + --freeze_language_encoder + "
+            "--no_train_policy_transformer leaves nothing to train."
+        )
+    for g in param_groups:
+        log.info(f"  Optimizer group '{g['name']}': {len(g['params'])} tensors, lr={g['lr']:.2e}")
     optimizer = torch.optim.AdamW(
-        params, lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=1e-10
+        param_groups, betas=(0.9, 0.95), eps=1e-8, weight_decay=1e-10
     )
+
     warmup = min(args.warmup_steps, args.steps_per_task // 10)
     lr_scheduler = make_cosine_warmup_scheduler(
         optimizer, warmup, args.steps_per_task, args.decay_lr_ratio
@@ -808,7 +849,6 @@ def run_sequential(
     is_main: bool = True,
     wandb_log=None,
 ) -> dict:
-    """Sequential CL: inherit previous task's weights each step."""
     gpu_ids = parse_gpus(args.gpus)
     if device is None:
         device = primary_device(gpu_ids)
@@ -823,7 +863,6 @@ def run_sequential(
     else:
         current_path = args.pretrained
 
-    # Download and cache the full dataset once (avoids broken per-episode download)
     full_dataset = build_full_dataset(
         args.dataset_repo_id, ds_meta, args.chunk_size, args.n_obs_steps, args.dataset_root
     )
@@ -845,15 +884,16 @@ def run_sequential(
             continue
         log.info(f"  Frames: {task_dataset.num_frames}")
 
-        # Load base policy with features adapted to the dataset
-        policy = load_base_policy(current_path, ds_meta, device)
+        policy = load_base_policy(current_path, ds_meta, device, args=args)
 
-        # Optionally wrap with LoRA
         if args.use_lora:
-            lora_targets = [m.strip() for m in args.lora_target_modules.split(",")]
-            policy = apply_lora(policy, args.lora_r, args.lora_alpha, args.lora_dropout, lora_targets)
+            lora_targets = _parse_lora_targets(args.lora_target_modules)
+            policy = apply_lora(
+                policy, args.lora_r, args.lora_alpha, args.lora_dropout, lora_targets,
+                train_policy_transformer=args.train_policy_transformer,
+                train_soft_prompts=args.train_soft_prompts,
+            )
 
-        # Wrap with DDP for multi-GPU training (after LoRA)
         policy = wrap_dp(policy, gpu_ids, local_rank=local_rank, is_ddp=(world_size > 1))
 
         base_cfg = get_base_config(policy)
@@ -876,11 +916,9 @@ def run_sequential(
             global_step_offset=task_order * args.steps_per_task,
         )
 
-        # Sync all ranks before saving
         if world_size > 1:
             dist.barrier()
 
-        # Only rank 0 saves checkpoints
         if is_main:
             ckpt_dir = output_dir / f"task_{task_order:02d}_tidx{task_idx}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -898,11 +936,10 @@ def run_sequential(
             current_path = str(ckpt_dir)
             _update_cl_state(cl_state, task_order, task_idx, task_name, task_dataset,
                              current_path, train_stats, output_dir)
-            log.info(f"  Checkpoint → {ckpt_dir}")
+            log.info(f"  Checkpoint -> {ckpt_dir}")
         else:
             current_path = str(output_dir / f"task_{task_order:02d}_tidx{task_idx}")
 
-        # Wait for rank 0 to finish writing before any rank loads next checkpoint
         if world_size > 1:
             dist.barrier()
 
@@ -930,11 +967,7 @@ def run_tail(
     is_main: bool = True,
     wandb_log=None,
 ) -> tuple[dict, LoRALibrary]:
-    """TAIL: per-task LoRA adapter, always trained on frozen base model.
-
-    Each adapter is saved independently; no information leaks between tasks
-    during training, so catastrophic forgetting is impossible by design.
-    """
+    """TAIL: per-task LoRA adapter, always trained on frozen base model."""
     gpu_ids = parse_gpus(args.gpus)
     if device is None:
         device = primary_device(gpu_ids)
@@ -942,7 +975,6 @@ def run_tail(
         log.info(f"  GPUs: {gpu_ids}  local_rank: {local_rank}  world_size: {world_size}  device: {device}")
         log_gpu_stats([local_rank] if world_size > 1 else gpu_ids, "initial ")
 
-    # Download and cache the full dataset once
     full_dataset = build_full_dataset(
         args.dataset_repo_id, ds_meta, args.chunk_size, args.n_obs_steps, args.dataset_root
     )
@@ -954,10 +986,7 @@ def run_tail(
     if world_size > 1:
         dist.barrier()
 
-    # Pre-load pretrained weights once; reuse across all tasks to avoid
-    # reloading ~1GB of VLM weights N times (once per task in TAIL).
     pretrained_cache = cache_pretrained_weights(args.pretrained)
-
     completed = {t["task_index"] for t in cl_state["tasks_completed"]}
 
     for task_order, task_idx in enumerate(task_indices):
@@ -977,14 +1006,16 @@ def run_tail(
             continue
         log.info(f"  Frames: {task_dataset.num_frames}")
 
-        # ── TAIL key step: always load from frozen BASE model ──────
-        base_policy = load_base_policy(args.pretrained, ds_meta, device, _cached=pretrained_cache)
+        base_policy = load_base_policy(args.pretrained, ds_meta, device, args=args, _cached=pretrained_cache)
 
-        # Apply fresh LoRA on top of frozen base
-        lora_targets = [m.strip() for m in args.lora_target_modules.split(",")]
-        policy = apply_lora(base_policy, args.lora_r, args.lora_alpha, args.lora_dropout, lora_targets)
+        lora_targets = _parse_lora_targets(args.lora_target_modules)
+        # TAIL: base model stays fully frozen; only per-task LoRA adapters train.
+        policy = apply_lora(
+            base_policy, args.lora_r, args.lora_alpha, args.lora_dropout, lora_targets,
+            train_policy_transformer=False,
+            train_soft_prompts=False,
+        )
 
-        # Wrap with DDP for multi-GPU training (after LoRA)
         policy = wrap_dp(policy, gpu_ids, local_rank=local_rank, is_ddp=(world_size > 1))
 
         base_cfg = get_base_config(policy)
@@ -1008,11 +1039,9 @@ def run_tail(
             global_step_offset=task_order * args.steps_per_task,
         )
 
-        # Sync all ranks before saving
         if world_size > 1:
             dist.barrier()
 
-        # Only rank 0 saves adapter and registers in library
         if is_main:
             adapter_dir = library_dir / f"task_tidx{task_idx}"
             save_lora_adapter(unwrap_dp(policy), adapter_dir)
@@ -1021,7 +1050,7 @@ def run_tail(
             lora_lib.register(task_idx, task_name, adapter_dir, adapter_dir)
             _update_cl_state(cl_state, task_order, task_idx, task_name, task_dataset,
                              str(adapter_dir), train_stats, output_dir)
-            log.info(f"  LoRA adapter → {adapter_dir}")
+            log.info(f"  LoRA adapter -> {adapter_dir}")
             log.info(f"  Library: {lora_lib}")
 
         del policy, base_policy, preprocessor, postprocessor, optimizer, lr_scheduler, task_dataset
@@ -1068,7 +1097,7 @@ def _run_rollout_episodes(
     env_preprocessor: Any,
     env_postprocessor: Any,
     suite_name: str,
-    libero_task_id: int,          # LIBERO benchmark task_id (≠ LeRobot task_index!)
+    libero_task_id: int,
     n_episodes: int,
     device: torch.device,
     obs_height: int = 360,
@@ -1076,12 +1105,6 @@ def _run_rollout_episodes(
     camera_name_mapping: dict | None = None,
     videos_dir: Path | None = None,
 ) -> dict[str, float]:
-    """Run rollout episodes on a single LIBERO task; return success metrics.
-
-    Args:
-        libero_task_id: The LIBERO benchmark task_id, which differs from the LeRobot
-            dataset task_index. Use build_lerobot_to_libero_task_id_map() to convert.
-    """
     from lerobot.envs.libero import create_libero_envs
     from lerobot.scripts.lerobot_eval import rollout
     import gymnasium as gym
@@ -1125,14 +1148,13 @@ def _run_rollout_episodes(
         ep_success = bool(result["success"].any())
         successes.append(ep_success)
 
-        # Save episode video
         if videos_dir is not None and ep_frames:
             from lerobot.utils.io_utils import write_video
             videos_dir.mkdir(parents=True, exist_ok=True)
             outcome = "success" if ep_success else "fail"
             video_path = videos_dir / f"ep{ep + 1:02d}_{outcome}.mp4"
             write_video(str(video_path), ep_frames, render_fps)
-            log.info(f"    episode {ep+1}/{n_episodes}: {'SUCCESS' if ep_success else 'fail'}  → {video_path.name}")
+            log.info(f"    episode {ep+1}/{n_episodes}: {'SUCCESS' if ep_success else 'fail'}  -> {video_path.name}")
         else:
             log.info(f"    episode {ep+1}/{n_episodes}: {'SUCCESS' if ep_success else 'fail'}")
 
@@ -1157,9 +1179,8 @@ def eval_sequential(
 ) -> dict:
     """Evaluate sequential CL: each task uses its own saved full checkpoint.
 
-    If args.eval_task is set (>= 0), ALL tasks in task_indices are evaluated
-    using the single checkpoint from that task order, enabling measurement of
-    catastrophic forgetting across the CL sequence.
+    If args.eval_task is set, ALL tasks are evaluated using that single checkpoint,
+    enabling measurement of catastrophic forgetting across the CL sequence.
     """
     from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
     from lerobot.envs.factory import make_env_pre_post_processors
@@ -1167,7 +1188,6 @@ def eval_sequential(
     results = {}
     suite_name = args.eval_suite or args.dataset_repo_id.split("/")[-1].replace("_image", "")
 
-    # Determine the fixed checkpoint to use (if --eval_task is set)
     fixed_ckpt_path = None
     if args.eval_task is not None:
         fixed_ckpt_key = str(args.eval_task)
@@ -1177,10 +1197,10 @@ def eval_sequential(
                 f"Available task_orders: {sorted(cl_state['task_checkpoints'].keys())}"
             )
         fixed_ckpt_path = cl_state["task_checkpoints"][fixed_ckpt_key]
-        log.info(f"  [CL-forgetting mode] All tasks evaluated with checkpoint from task_order={args.eval_task}: {fixed_ckpt_path}")
+        log.info(f"  [CL-forgetting mode] All tasks evaluated with checkpoint from "
+                 f"task_order={args.eval_task}: {fixed_ckpt_path}")
 
-    # Build task_index → LIBERO task_id mapping (ordering differs between LeRobot and LIBERO)
-    log.info("  Building LeRobot→LIBERO task_id mapping…")
+    log.info("  Building LeRobot->LIBERO task_id mapping...")
     task_id_map = build_lerobot_to_libero_task_id_map(suite_name, ds_meta)
 
     for task_order, task_idx in enumerate(task_indices):
@@ -1192,13 +1212,12 @@ def eval_sequential(
         libero_task_id = task_id_map[task_idx]
         ckpt_path = fixed_ckpt_path if fixed_ckpt_path is not None else cl_state["task_checkpoints"][ckpt_key]
         task_name = get_task_name(ds_meta, task_idx)
-        log.info(f"\n[Eval-Sequential] task_idx={task_idx} → LIBERO task_id={libero_task_id} | {task_name!r}")
+        log.info(f"\n[Eval-Sequential] task_idx={task_idx} -> LIBERO task_id={libero_task_id} | {task_name!r}")
         log.info(f"  Loading: {ckpt_path}")
 
-        policy = SmolVLAPolicy.from_pretrained(ckpt_path).to(device)
+        policy = XVLAPolicy.from_pretrained(ckpt_path).to(device)
         policy.eval()
 
-        # Preprocessors saved alongside the checkpoint
         from lerobot.processor import PolicyProcessorPipeline
         from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
         from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME, POLICY_POSTPROCESSOR_DEFAULT_NAME
@@ -1213,7 +1232,19 @@ def eval_sequential(
 
         _cam_map = {"agentview_image": "image", "robot0_eye_in_hand_image": "wrist_image"}
         env_cfg = LiberoEnvConfig(task=suite_name, task_ids=[libero_task_id], camera_name_mapping=_cam_map)
-        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg, policy.config)
+        # env_preprocessor must only do LiberoProcessorStep (flip images + process state).
+        # The policy preprocessor (loaded from checkpoint) already contains image_to_float,
+        # imagenet_normalize, add_domain_id, and tokenize. Applying make_env_pre_post_processors
+        # (which also includes imagenet_normalize + domain_id) would double-process images,
+        # causing XVLAImageToFloatProcessorStep to fail on already-normalized values.
+        from lerobot.policies.xvla.processor_xvla import LiberoProcessorStep
+        from lerobot.processor import PolicyProcessorPipeline as _PPL
+        env_preprocessor = _PPL(steps=[LiberoProcessorStep()])
+        # env_postprocessor must be identity: XVLARotation6DToAxisAngleProcessorStep expects
+        # 10D input [3pos+6rot+1grip] but AutoActionSpace.postprocess() already trims model
+        # output (20D) to real_dim (7D axis-angle). Applying it would extract wrong slices
+        # (gripper at [:, 9:10] from a 7-element tensor = empty) → 6D output instead of 7D.
+        env_postprocessor = _PPL(steps=[])
 
         _vdir_root = eval_output_dir if eval_output_dir is not None else output_dir
         videos_dir = (_vdir_root / "eval_videos" / f"task{task_idx}") if args.save_videos else None
@@ -1251,16 +1282,13 @@ def eval_tail(
     from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME, POLICY_POSTPROCESSOR_DEFAULT_NAME
 
     suite_name = args.eval_suite or args.dataset_repo_id.split("/")[-1].replace("_image", "")
-    # camera key mapping: simulator names → dataset/policy names used in training
     _cam_map = {"agentview_image": "image", "robot0_eye_in_hand_image": "wrist_image"}
     results = {}
 
-    # Build task_index → LIBERO task_id mapping (ordering differs between LeRobot and LIBERO)
-    log.info("  Building LeRobot→LIBERO task_id mapping…")
+    log.info("  Building LeRobot->LIBERO task_id mapping...")
     task_id_map = build_lerobot_to_libero_task_id_map(suite_name, ds_meta)
 
-    # Pre-load base weights once; reused for every task adapter
-    log.info("  Pre-loading base model weights for eval…")
+    log.info("  Pre-loading base model weights for eval...")
     pretrained_cache = cache_pretrained_weights(lora_lib.base_model)
 
     for task_idx in task_indices:
@@ -1272,23 +1300,18 @@ def eval_tail(
         libero_task_id = task_id_map[task_idx]
         task_name = adapter_info["task_name"]
         adapter_path = Path(adapter_info["adapter_path"])
-        log.info(f"\n[Eval-TAIL] task_idx={task_idx} → LIBERO task_id={libero_task_id} | {task_name!r}")
+        log.info(f"\n[Eval-TAIL] task_idx={task_idx} -> LIBERO task_id={libero_task_id} | {task_name!r}")
         log.info(f"  Base model: {lora_lib.base_model}")
         log.info(f"  Adapter: {adapter_path}")
 
-        # Load frozen base model (uses cached weights — no repeated download)
-        base_policy = load_base_policy(lora_lib.base_model, ds_meta, device, _cached=pretrained_cache)
-
-        # Load task-specific LoRA adapter, merge into SmolVLAPolicy for fast inference
+        base_policy = load_base_policy(lora_lib.base_model, ds_meta, device, args=args, _cached=pretrained_cache)
         peft_policy = load_lora_adapter(base_policy, adapter_path)
         merged_policy = merge_lora_into_policy(peft_policy)
         merged_policy.eval()
 
-        # Load per-task preprocessor (task-specific normalization stats)
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             str(adapter_path), config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
         )
-        # postprocessor unnormalizes actions; input is PolicyAction (Tensor), output must also be Tensor
         postprocessor = PolicyProcessorPipeline.from_pretrained(
             str(adapter_path), config_filename=f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
             to_transition=policy_action_to_transition,
@@ -1296,7 +1319,10 @@ def eval_tail(
         )
 
         env_cfg = LiberoEnvConfig(task=suite_name, task_ids=[libero_task_id], camera_name_mapping=_cam_map)
-        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg, merged_policy.config)
+        from lerobot.policies.xvla.processor_xvla import LiberoProcessorStep
+        from lerobot.processor import PolicyProcessorPipeline as _PPL
+        env_preprocessor = _PPL(steps=[LiberoProcessorStep()])
+        env_postprocessor = _PPL(steps=[])  # identity: auto mode already outputs 7D axis-angle
 
         _vdir_root = eval_output_dir if eval_output_dir is not None else Path(args.output_dir)
         videos_dir = (_vdir_root / "eval_videos" / f"task{task_idx}") if args.save_videos else None
@@ -1321,7 +1347,7 @@ def eval_tail(
 def _log_eval_summary(results: dict) -> None:
     if not results:
         return
-    log.info("\n" + "─"*60)
+    log.info("\n" + "-"*60)
     log.info("Evaluation Summary:")
     per_task_sr = []
     for task_idx, info in sorted(results.items(), key=lambda x: x[0]):
@@ -1330,16 +1356,16 @@ def _log_eval_summary(results: dict) -> None:
         log.info(f"  Task {task_idx} ({info.get('task_name','')[:40]}): "
                  f"{sr:.1%}  ({info.get('n_success',0)}/{info.get('n_episodes',0)})")
     mean_sr = sum(per_task_sr) / len(per_task_sr) if per_task_sr else 0.0
-    log.info(f"  ─────────────────────────────────────────────────")
+    log.info(f"  {'─'*49}")
     log.info(f"  Mean success rate: {mean_sr:.1%}  (across {len(per_task_sr)} tasks)")
-    log.info("─"*60)
+    log.info("-"*60)
 
 
 def save_eval_results(results: dict, output_dir: Path, suffix: str = "") -> None:
     path = output_dir / f"eval_results{suffix}.json"
     with open(path, "w") as f:
         json.dump(results, f, indent=2, default=str)
-    log.info(f"Eval results saved → {path}")
+    log.info(f"Eval results saved -> {path}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1347,9 +1373,6 @@ def save_eval_results(results: dict, output_dir: Path, suffix: str = "") -> None
 # ══════════════════════════════════════════════════════════════════
 
 def run(args: argparse.Namespace) -> None:
-    # ── DDP initialization ───────────────────────────────────────
-    # Single-process: init_ddp() returns (False, 0, 0, 1), device from --gpus.
-    # torchrun: each process gets its local_rank; device = cuda:<local_rank>.
     is_ddp, local_rank, rank, world_size = init_ddp()
     is_main = (rank == 0)
 
@@ -1357,7 +1380,6 @@ def run(args: argparse.Namespace) -> None:
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
     init_logging()
-    # 非主进程只打印 WARNING 以上的日志，避免4份日志混在一起
     if not is_main:
         logging.getLogger().setLevel(logging.WARNING)
     set_seed(args.seed)
@@ -1371,7 +1393,6 @@ def run(args: argparse.Namespace) -> None:
         log.info(f"DDP       : {is_ddp}  (world_size={world_size})")
         log.info(f"GPUs      : {gpu_ids if gpu_ids else 'CPU'}  device: {device}")
 
-    # ── Weights & Biases ────────────────────────────────────────
     _wandb_log = None
     if is_main and args.wandb and not args.eval_rollout:
         try:
@@ -1390,7 +1411,6 @@ def run(args: argparse.Namespace) -> None:
 
     cl_state_path = output_dir / "cl_state.json"
 
-    # ── Resume ───────────────────────────────────────────────────
     if args.resume and cl_state_path.exists():
         with open(cl_state_path) as f:
             cl_state = json.load(f)
@@ -1412,11 +1432,6 @@ def run(args: argparse.Namespace) -> None:
             "task_stats": {},
         }
 
-    # ── Dataset metadata ─────────────────────────────────────────
-    if not args.eval_rollout or not cl_state.get("tasks_completed"):
-        # Only need metadata during training (or if no tasks are done yet)
-        pass
-
     log.info(f"Loading dataset metadata: {args.dataset_repo_id}")
     ds_meta = LeRobotDatasetMetadata(
         repo_id=args.dataset_repo_id,
@@ -1426,18 +1441,16 @@ def run(args: argparse.Namespace) -> None:
 
     if args.suite:
         task_indices = resolve_suite(args.suite)
-        log.info(f"Suite: {args.suite!r} → task_indices {task_indices}")
+        log.info(f"Suite: {args.suite!r} -> task_indices {task_indices}")
     elif args.task_indices:
         task_indices = list(args.task_indices)
     else:
         task_indices = list(range(len(ds_meta.tasks)))
     log.info(f"CL sequence ({len(task_indices)} tasks): {task_indices}")
 
-    # ── 参数校验 ─────────────────────────────────────────────────
     if args.cl_method == "tail" and not args.use_lora and not args.eval_rollout:
         raise ValueError("--cl_method tail requires --use_lora.")
 
-    # ── Training phase ────────────────────────────────────────────
     _ddp_kwargs = dict(device=device, rank=rank, world_size=world_size,
                        local_rank=local_rank, is_main=is_main)
     if not args.eval_rollout:
@@ -1450,12 +1463,9 @@ def run(args: argparse.Namespace) -> None:
         else:
             raise ValueError(f"Unknown --cl_method: {args.cl_method!r}. Choose 'sequential' or 'tail'.")
 
-    # ── Evaluation phase ──────────────────────────────────────────
-    # eval 只在 rank 0 跑：环境交互、视频录制、结果写文件都是单进程操作
     if args.eval_rollout and is_main:
         log.info("\n" + "="*60)
-        log.info("Starting rollout evaluation…")
-        # Headless OpenGL rendering via EGL (required on GPU servers without a display)
+        log.info("Starting rollout evaluation...")
         if not os.environ.get("MUJOCO_GL"):
             os.environ["MUJOCO_GL"] = "egl"
         try:
@@ -1477,7 +1487,7 @@ def run(args: argparse.Namespace) -> None:
             lora_lib = LoRALibrary(library_dir)
             results = eval_tail(args, lora_lib, ds_meta, task_indices, eval_device,
                                 eval_output_dir=eval_output_dir)
-        else:  # sequential
+        else:
             results = eval_sequential(args, cl_state, ds_meta, task_indices, output_dir, eval_device,
                                       eval_output_dir=eval_output_dir)
 
@@ -1504,52 +1514,50 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Continual Learning training of SmolVLA on LIBERO (sequential or TAIL)",
+        description="Continual Learning training of X-VLA on LIBERO (sequential or TAIL)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # ── Model ──────────────────────────────────────────────────────
-    p.add_argument("--pretrained", default="lerobot/smolvla_base",
-                   help="Initial SmolVLA checkpoint (HF Hub ID or local path).")
+    p.add_argument("--pretrained", default="lerobot/xvla-base",
+                   help="Initial XVLA checkpoint (HF Hub ID or local path).")
 
     # ── Dataset ───────────────────────────────────────────────────
     p.add_argument("--dataset_repo_id", default="lerobot/libero_10",
-                   help="LeRobot-format LIBERO dataset. Default: lerobot/libero_10 (10 long-horizon "
-                        "tasks, ~600 MB). For multi-suite experiments use HuggingFaceVLA/libero "
-                        "(40 tasks, much larger) together with --suite.")
+                   help="LeRobot-format LIBERO dataset.")
     p.add_argument("--dataset_root", default=None,
                    help="Optional local dataset root (skips Hub download).")
     p.add_argument("--task_indices", type=int, nargs="+", default=None,
-                   help="Specific task indices to train on (in order). Default: all tasks in dataset.")
+                   help="Specific task indices to train on (in order). Default: all tasks.")
     p.add_argument("--suite", default=None,
                    choices=["libero_spatial", "libero_object", "libero_goal", "libero_10",
                             "spatial", "object", "goal", "long", "libero_long"],
-                   help="LIBERO suite to train on. Only meaningful with HuggingFaceVLA/libero (40 tasks). "
-                        "Maps to task indices: spatial→0-9, object→10-19, goal→20-29, libero_10→30-39. "
-                        "Overrides --task_indices.")
+                   help="LIBERO suite to train on. Overrides --task_indices.")
 
     # ── CL method ────────────────────────────────────────────────
     p.add_argument("--cl_method", default="sequential", choices=["sequential", "tail"],
-                   help="CL strategy: 'sequential' (inherit prev ckpt) or "
-                        "'tail' (per-task LoRA adapters on frozen base).")
+                   help="CL strategy: 'sequential' or 'tail'.")
 
     # ── LoRA ─────────────────────────────────────────────────────
     p.add_argument("--use_lora", action="store_true",
-                   help="Enable LoRA fine-tuning. Required when --cl_method=tail; "
-                        "optional for sequential (LoRA is merged into the checkpoint after each task).")
-    p.add_argument("--lora_r", type=int, default=16,
-                   help="LoRA rank (higher = more capacity, more parameters).")
-    p.add_argument("--lora_alpha", type=int, default=32,
-                   help="LoRA alpha (scaling factor = alpha / r).")
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    p.add_argument("--lora_target_modules", default="q_proj,v_proj",
-                   help="Comma-separated list of module names to apply LoRA to. "
-                        "For SmolVLA: 'q_proj,v_proj' targets VLM attention. "
-                        "Add 'k_proj,o_proj' for more capacity. "
-                        "Use 'all-linear' to target all linear layers.")
+                   help="Enable LoRA fine-tuning. Required for --cl_method=tail.")
+    p.add_argument("--lora_r", type=int, default=64,
+                   help="LoRA rank. Official PEFT docs recommend r=64 for LIBERO.")
+    p.add_argument("--lora_alpha", type=int, default=64,
+                   help="LoRA alpha (scaling = alpha / r). Default 64 → scaling=1.0.")
+    p.add_argument("--lora_dropout", type=float, default=0.0)
+    p.add_argument(
+        "--lora_target_modules",
+        default="q_proj,v_proj",
+        help="Comma-separated module name suffixes for LoRA injection (PEFT suffix matching). "
+             "Default 'q_proj,v_proj' targets Florence2 BART encoder self-attention Q/V projections. "
+             "Actual module path: policy.model.vlm.language_model.model.encoder.layers.N.self_attn.q_proj. "
+             "Add 'k_proj,out_proj' for more capacity. "
+             "Note: policy transformer uses 'attn.proj' (single proj), add it explicitly if needed.",
+    )
 
     # ── Training ──────────────────────────────────────────────────
-    p.add_argument("--output_dir", default="outputs/cl_smolvla_libero")
+    p.add_argument("--output_dir", default="outputs/cl_xvla_libero")
     p.add_argument("--steps_per_task", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -1559,41 +1567,76 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_clip_norm", type=float, default=10.0)
     p.add_argument("--num_workers", type=int, default=4)
 
-    # ── SmolVLA arch (must match pretrained model) ────────────────
-    p.add_argument("--chunk_size", type=int, default=50,
-                   help="Number of predicted action steps (SmolVLA default: 50).")
+    # ── XVLA arch / training flags ────────────────────────────────
+    p.add_argument("--chunk_size", type=int, default=30,
+                   help="Number of predicted action steps. Pretrained xvla-base uses 30.")
     p.add_argument("--n_obs_steps", type=int, default=1,
-                   help="Observation history length (SmolVLA default: 1).")
+                   help="Observation history length (XVLA default: 1).")
+    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"],
+                   help="Model dtype. bfloat16 saves memory; XVLA config default is float32.")
+    p.add_argument("--freeze_vision_encoder", action="store_true",
+                   help="Freeze Florence2 vision encoder (vision_tower). "
+                        "Language encoder and policy transformer remain trainable.")
+    p.add_argument("--freeze_language_encoder", action="store_true",
+                   help="Freeze Florence2 language encoder. Analogous to --train_expert_only "
+                        "in Pi05 — prevents VLM language representation drift across tasks. "
+                        "Recommended for Sequential CL to reduce catastrophic forgetting.")
+    p.add_argument("--phase2", action="store_true",
+                   help="Phase II fine-tuning style: freeze both vision and language encoders, "
+                        "train only the policy transformer + soft prompts (~311M / 35%% of params). "
+                        "Shortcut for --freeze_vision_encoder --freeze_language_encoder. "
+                        "Faster per-task adaptation with less VLM forgetting risk. "
+                        "Equivalent to the XVLAConfig default comment 'freeze VLM, train policy'.")
+    p.add_argument("--no_train_policy_transformer", action="store_true",
+                   help="Freeze the SoftPromptedTransformer (policy head). "
+                        "Only soft prompts would remain trainable. Rarely useful.")
+    p.add_argument("--no_train_soft_prompts", action="store_true",
+                   help="Freeze soft prompt embeddings. Not recommended for CL.")
+    p.add_argument("--action_mode", default="auto",
+                   choices=["ee6d", "joint", "auto"],
+                   help="Action space type for LIBERO. 'auto' (recommended) infers real_dim from dataset "
+                        "and trims model output accordingly. 'ee6d' is for 20D 6D-rotation format datasets "
+                        "and is NOT compatible with lerobot/libero_10 (which has 7D axis-angle actions).")
+    p.add_argument("--num_denoising_steps", type=int, default=10,
+                   help="Flow-matching denoising steps at inference (XVLA default: 10).")
+    p.add_argument("--tokenizer_max_length", type=int, default=128,
+                   help="Max token length for task description. Pretrained default is 1024 with "
+                        "pad_language_to=max_length, which makes vlm_features ~1073 tokens and "
+                        "exceeds the policy transformer's max_len_seq=512. LIBERO task descriptions "
+                        "are ~25-35 tokens; 128 is more than sufficient.")
+    p.add_argument("--vlm_lr_scale", type=float, default=0.1,
+                   help="LR multiplier for Florence2 (VLM) params in full fine-tuning. "
+                        "Matches XVLAAdamWConfig default of 1/10 VLM LR. "
+                        "In Phase II / freeze modes, VLM is frozen so this has no effect.")
+    p.add_argument("--soft_prompt_lr_scale", type=float, default=1.0,
+                   help="LR multiplier for soft_prompt_hub params. Default 1.0 (same as transformer). "
+                        "Matches XVLAAdamWConfig.soft_prompt_lr_scale. "
+                        "Set lower (e.g. 0.1) to warm up soft prompts gradually.")
 
     # ── Evaluation ────────────────────────────────────────────────
     p.add_argument("--eval_rollout", action="store_true",
-                   help="Run online rollout evaluation instead of training. "
-                        "Requires LIBERO to be installed.")
+                   help="Run online rollout evaluation instead of training.")
     p.add_argument("--n_eval_episodes", type=int, default=20,
                    help="Number of rollout episodes per task during evaluation.")
     p.add_argument("--save_videos", action="store_true",
                    help="Save rollout episode videos to {output_dir}/eval_videos/task<N>/.")
     p.add_argument("--eval_suite", default=None,
-                   help="LIBERO suite name for evaluation (default: inferred from dataset_repo_id). "
-                        "E.g. 'libero_spatial', 'libero_10'.")
+                   help="LIBERO suite name for evaluation (default: inferred from dataset_repo_id).")
     p.add_argument("--eval_task", type=int, default=None,
                    help="(Sequential only) Fix a single checkpoint (by task_order) to evaluate ALL tasks. "
-                        "E.g. --eval_task 1 uses the task_01 checkpoint for every task in --task_indices, "
-                        "measuring catastrophic forgetting. Default (None) uses each task's own checkpoint.")
+                        "Measures catastrophic forgetting. Default (None) uses each task's own checkpoint.")
     p.add_argument("--eval_output_dir", default=None,
-                   help="Directory to save eval results (eval_results_*.json) and videos. "
-                        "Defaults to --output_dir if not set.")
+                   help="Directory to save eval results and videos. Defaults to --output_dir.")
 
     # ── Hardware ──────────────────────────────────────────────────
     p.add_argument("--gpus", default="0",
-                   help="GPU ID for single-process training (e.g. '0' or '3'). "
-                        "For multi-GPU DDP use torchrun --nproc_per_node=N instead; "
-                        "this flag is ignored in that case. CPU: '' (empty string).")
+                   help="GPU ID for single-process training. "
+                        "Use torchrun --nproc_per_node=N for multi-GPU DDP.")
 
     # ── Weights & Biases ─────────────────────────────────────────
     p.add_argument("--wandb", action="store_true",
                    help="Enable Weights & Biases logging.")
-    p.add_argument("--wandb_project", default="cl-smolvla-libero",
+    p.add_argument("--wandb_project", default="cl-xvla-libero",
                    help="W&B project name.")
     p.add_argument("--wandb_run_name", default=None,
                    help="W&B run name (default: {cl_method}_{output_dir_name}).")
@@ -1604,7 +1647,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true",
                    help="Skip completed tasks and continue from last checkpoint.")
 
-    return p.parse_args()
+    args = p.parse_args()
+    # --phase2 is a shortcut for freezing the entire VLM backbone
+    if args.phase2:
+        args.freeze_vision_encoder = True
+        args.freeze_language_encoder = True
+    # Convert negation store_true flags to positive booleans for config
+    args.train_policy_transformer = not args.no_train_policy_transformer
+    args.train_soft_prompts = not args.no_train_soft_prompts
+    return args
 
 
 if __name__ == "__main__":

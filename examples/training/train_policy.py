@@ -25,7 +25,7 @@ from lerobot.policies.diffusion import DiffusionConfig, DiffusionPolicy
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 
-def main():
+def main():ß
     # Create a directory to store the training checkpoint.
     output_directory = Path("outputs/train/example_pusht_diffusion")
     output_directory.mkdir(parents=True, exist_ok=True)

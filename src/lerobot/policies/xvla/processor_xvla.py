@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -128,33 +128,36 @@ class LiberoProcessorStep(ObservationProcessorStep):
     def _process_observation(self, observation):
         """
         Processes both image and robot_state observations from LIBERO.
+
+        State format matches lerobot/libero_10 dataset exactly:
+          [eef_x, eef_y, eef_z, axis_angle_x, axis_angle_y, axis_angle_z, gripper_qpos[0], gripper_qpos[1]]
+        = 8D. Quaternion is converted to axis-angle via _quat2axisangle (same as the
+        official lerobot.processor.LiberoProcessorStep in env_processor.py).
+
+        The model's XVLAPolicy._prepare_state pads this 8D to max_state_dim=20 with zeros,
+        identical to training where the 8D dataset state is also padded to 20D internally.
         """
         processed_obs = observation.copy()
         for key in list(processed_obs.keys()):
             if key.startswith(f"{OBS_IMAGES}."):
                 img = processed_obs[key]
-
-                if key == f"{OBS_IMAGES}.image":
-                    # Flip both H and W
-                    img = torch.flip(img, dims=[2, 3])
-
+                # Flip both H and W for all cameras (compensates for LIBERO camera convention)
+                img = torch.flip(img, dims=[2, 3])
                 processed_obs[key] = img
-        # Process robot_state into a flat state vector
+
         robot_state_str = OBS_PREFIX + "robot_state"
         if robot_state_str in processed_obs:
             robot_state = processed_obs.pop(robot_state_str)
 
-            # Extract components
-            eef_pos = robot_state["eef"]["pos"]  # (B, 3,)
-            eef_mat = robot_state["eef"]["mat"]  # (B, 3, 3)
-            eef_rot6d = self._mat_to_rotate6d(eef_mat)  # (B, 6)
+            eef_pos = robot_state["eef"]["pos"].float()          # (B, 3)
+            eef_quat = robot_state["eef"]["quat"].float()         # (B, 4) [qx,qy,qz,qw]
+            gripper_qpos = robot_state["gripper"]["qpos"].float() # (B, 2)
 
-            extra = torch.zeros((eef_pos.shape[0], 1), dtype=torch.float32, device=eef_pos.device)
+            # Convert quaternion → axis-angle (matches dataset recording convention)
+            eef_axisangle = self._quat2axisangle(eef_quat)  # (B, 3)
 
-            proprio_state = torch.cat((eef_pos, eef_rot6d, extra), dim=-1)  # (B, 10)
-            state = torch.cat((proprio_state, torch.zeros_like(proprio_state)), dim=-1)  # (B, 20)
-            # ensure float32
-            state = state.float()
+            # [x,y,z, ax,ay,az, grip0, grip1] = 8D — matches lerobot/libero_10 state format
+            state = torch.cat([eef_pos, eef_axisangle, gripper_qpos], dim=-1).float()
             if state.dim() == 1:
                 state = state.unsqueeze(0)
 
@@ -169,54 +172,33 @@ class LiberoProcessorStep(ObservationProcessorStep):
         """
         new_features: dict[PipelineFeatureType, dict[str, PolicyFeature]] = {}
 
-        # copy over non-STATE features
         for ft, feats in features.items():
             if ft != PipelineFeatureType.STATE:
                 new_features[ft] = feats.copy()
 
-        # rebuild STATE features
-        state_feats = {}
-
-        # add our new flattened state
-        state_feats[OBS_STATE] = PolicyFeature(
-            key=OBS_STATE,
-            shape=(20,),
-            dtype="float32",
-        )
-
+        state_feats = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,))
+        }
         new_features[PipelineFeatureType.STATE] = state_feats
 
         return new_features
 
-    def _mat_to_rotate6d(self, rot_mats: torch.Tensor) -> torch.Tensor:
-        """
-        Convert batched rotation matrices (B, 3, 3) into 6D rotation representation (B, 6).
-
-        Args:
-            rot_mats (Tensor): Rotation matrices of shape (B, 3, 3)
-
-        Returns:
-            Tensor: 6D rotation representation, shape (B, 6)
-
-        Raises:
-            TypeError: if input is not a torch tensor
-            ValueError: if shape is not (B, 3, 3)
-        """
-
-        if not isinstance(rot_mats, torch.Tensor):
-            raise TypeError(f"mat_to_rot6d expects a torch.Tensor, got {type(rot_mats)}")
-
-        if rot_mats.ndim != 3 or rot_mats.shape[1:] != (3, 3):
-            raise ValueError(f"mat_to_rot6d expects shape (B, 3, 3), got {tuple(rot_mats.shape)}")
-
-        rot_mats = rot_mats.to(torch.float32)
-
-        col1 = rot_mats[:, :3, 0]  # (B, 3)
-        col2 = rot_mats[:, :3, 1]  # (B, 3)
-
-        rot6d = torch.cat([col1, col2], dim=-1)  # (B, 6)
-
-        return rot6d
+    def _quat2axisangle(self, quat: torch.Tensor) -> torch.Tensor:
+        """Convert (B,4) quaternion [qx,qy,qz,qw] → (B,3) axis-angle."""
+        if not isinstance(quat, torch.Tensor):
+            raise TypeError(f"_quat2axisangle expected torch.Tensor, got {type(quat)}")
+        if quat.ndim != 2 or quat.shape[1] != 4:
+            raise ValueError(f"_quat2axisangle expected shape (B,4), got {tuple(quat.shape)}")
+        quat = quat.to(dtype=torch.float32)
+        w = quat[:, 3].clamp(-1.0, 1.0)
+        den = torch.sqrt(torch.clamp(1.0 - w * w, min=0.0))
+        result = torch.zeros((quat.shape[0], 3), device=quat.device)
+        mask = den > 1e-10
+        if mask.any():
+            angle = 2.0 * torch.acos(w[mask])
+            axis = quat[mask, :3] / den[mask].unsqueeze(1)
+            result[mask] = axis * angle.unsqueeze(1)
+        return result
 
     def observation(self, observation):
         return self._process_observation(observation)
@@ -496,10 +478,10 @@ class XVLARotation6DToAxisAngleProcessorStep(ProcessorStep):
         if action is None or not isinstance(action, torch.Tensor):
             return new_transition
 
-        # Convert to numpy for processing
+        # Convert to numpy for processing (numpy doesn't support bfloat16)
         device = action.device
         dtype = action.dtype
-        action_np = action.cpu().numpy()
+        action_np = action.cpu().float().numpy()
 
         # Extract components
         # action shape: (B, D) where D >= 10
